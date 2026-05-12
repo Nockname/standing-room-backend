@@ -1,6 +1,7 @@
 from supabase import create_client
 import requests
 import re
+import json
 from datetime import datetime
 from pprint import pprint
 import pytz
@@ -15,30 +16,52 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, parent_dir)
 from keys.keys import SUPABASE_KEY, SUPABASE_URL, EMAIL, EMAIL_PASSWORD
 
-URLS = {
-    "broadway": "https://www.tdf.org/on-stage/show-finder/?page=1&pageSize=100&tdfMembership=true&venueId=1",
-    "off_broadway": "https://www.tdf.org/on-stage/show-finder/?page=1&pageSize=100&tdfMembership=true&venueId=2",
-    "off_off_broadway": "https://www.tdf.org/on-stage/show-finder/?page=1&pageSize=100&tdfMembership=true&venueId=3"
+# Venue IDs used by tdf.org's show finder backend.
+VENUE_IDS = {
+    "broadway": 1,
+    "off_broadway": 2,
+    "off_off_broadway": 3,
 }
 
-VENUES = URLS.keys()
+VENUES = VENUE_IDS.keys()
+
+SHOW_FINDER_PAGE = "https://www.tdf.org/on-stage/show-finder/?tdfMembership=true"
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# use requests to find current TDF offers
+
+def _fetch_showfinder_config(session):
+    """Scrape the show finder page for the ajax url + nonce."""
+    response = session.get(SHOW_FINDER_PAGE)
+    response.raise_for_status()
+    match = re.search(r'TDF_SF_AJAX\s*=\s*({[^}]+})', response.text)
+    if not match:
+        raise RuntimeError("Could not locate TDF_SF_AJAX config on show finder page")
+    return json.loads(match.group(1))
+
+
+# Use the tdf.org show finder admin-ajax endpoint to fetch the current set
+# of TDF-member offers per venue.
 def get_current_tdf_offers():
-    
+    session = requests.Session()
+    config = _fetch_showfinder_config(session)
+
     current_tdf_offers = {}
-
-    for venue in VENUES:
-
-        response = requests.get(URLS[venue])
-        html_content = response.text.replace('&#x27;', "'").replace('&amp;', "&")
-
-        # Use regex to find all alt attributes in img tags with class "to-be-scaled img-el"
-        show_titles = re.findall(r'<img[^>]*class="to-be-scaled img-el"[^>]*alt="([^"]+)"', html_content)
-        
-        current_tdf_offers[venue] = show_titles
+    for venue, venue_id in VENUE_IDS.items():
+        response = session.post(config["url"], data={
+            "action": "tdf_showfinder_query",
+            "nonce": config["nonce"],
+            "page": "1",
+            "pageSize": "100",
+            "isTDFMembership": "1",
+            "venues[]": str(venue_id),
+        })
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise RuntimeError(f"TDF show finder query failed for {venue}: {payload}")
+        shows = payload.get("data", {}).get("shows", []) or []
+        current_tdf_offers[venue] = [show["Title"] for show in shows if show.get("Title")]
 
     return current_tdf_offers
 
@@ -226,4 +249,6 @@ def main():
     # update supabase with current offers
     store_current_tdf_offers(current_tdf_offers)
 
-main()
+
+if __name__ == "__main__":
+    main()
